@@ -2,14 +2,18 @@
 # app.R
 #
 # Shiny app that:
-#  1. Fetches raw METAR & raw TAF from AviationWeather.gov
-#  2. Sends each raw METAR/TAF string to FlightPlanDatabase.com to decode
-#     into a JSON array of { "string", "description" }
-#  3. Displays, for each METAR:
+#  1. Reads a CSV of airports (with columns: ID, Name, City, Country, IATA, ICAO, …).
+#  2. Presents a selectizeInput allowing the user to search by airport name or city
+#     (displayed as "Name (City)"), but under the hood only the ICAO code is propagated.
+#     Uses server-side selectize for performance and starts with no selection.
+#  3. Fetches raw METAR & raw TAF from AviationWeather.gov using the selected ICAO.
+#  4. Sends each raw METAR/TAF string to FlightPlanDatabase.com to decode into a JSON array
+#     of { "string", "description" }.
+#  5. Displays, for each METAR:
 #       • The human‐readable observation time (converted from obsTime)
 #       • The raw METAR text
 #       • A table of tokens + descriptions from FlightPlanDatabase
-#     and similarly for each TAF (without displaying an obsTime for TAF).
+#     and similarly for each TAF.
 #
 # Required packages:
 #   install.packages(c("shiny", "httr", "jsonlite", "stringr"))
@@ -21,7 +25,39 @@ library(jsonlite)
 library(stringr)
 
 # ------------------------------------------------------------------------------
-# Helper: Fetch only the raw METAR & raw TAF from AviationWeather.gov,
+# 1) Load the airports CSV at app startup
+#    - The CSV has no header. Column 2 = Airport Name, Column 3 = City, Column 6 = ICAO.
+#    - We build a named vector: names = "Name (City)", values = ICAO.
+# ------------------------------------------------------------------------------
+airports_df <- read.csv(
+  "airports.csv",
+  header = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# Ensure the file was read correctly:
+#   V2 = airport name, V3 = city, V6 = ICAO
+# Remove any rows where ICAO is missing or empty
+airports_df <- airports_df[airports_df$V6 != "" & !is.na(airports_df$V6), ]
+
+# Build the "label" column: "Name (City)"
+airport_labels <- paste0(
+  airports_df$V2,
+  " (",
+  airports_df$V3,
+  ")"
+)
+
+# Build a named vector: names = label, values = ICAO
+# This will be passed to selectizeInput server-side
+icao_choices <- setNames(
+  airports_df$V6,
+  airport_labels
+)
+
+# ------------------------------------------------------------------------------
+# 2) Helper: Fetch only the raw METAR & raw TAF from AviationWeather.gov,
 #         including obsTime (UNIX epoch) for METAR.
 # ------------------------------------------------------------------------------
 fetch_metar_plus_taf <- function(icao, hours_back = 3, include_taf = FALSE) {
@@ -83,7 +119,7 @@ fetch_metar_plus_taf <- function(icao, hours_back = 3, include_taf = FALSE) {
 }
 
 # ------------------------------------------------------------------------------
-# Helper: Query FlightPlanDatabase.com for the decoded "parts" JSON
+# 3) Helper: Query FlightPlanDatabase.com for the decoded "parts" JSON
 #          Input:  raw_string (e.g. "KLAX 311053Z 23004KT 6SM BR FEW008 …")
 #          Output: data.frame with columns "string" and "description",
 #                  or NULL on any error.
@@ -131,17 +167,22 @@ decode_via_flightdb <- function(raw_string) {
 }
 
 # ------------------------------------------------------------------------------
-# Shiny UI (unchanged except for minor labeling)
+# Shiny UI
 # ------------------------------------------------------------------------------
 ui <- fluidPage(
-  titlePanel("METAR + TAF Raw Strings & FlightDB‐Powered Breakdown"),
+  titlePanel("Select Airport and View METAR/TAF Breakdown"),
   sidebarLayout(
     sidebarPanel(
-      textInput(
-        inputId     = "icao_code",
-        label       = "Enter ICAO Code:",
-        value       = "",
-        placeholder = "e.g. KLAX, KJFK, EGLL"
+      # Use selectizeInput with choices = NULL; we'll populate server-side
+      selectizeInput(
+        inputId  = "icao_code",
+        label    = "Select Airport:",
+        choices  = NULL,
+        multiple = FALSE,
+        options  = list(
+          placeholder = "Type airport name or city...",
+          maxOptions  = 50
+        )
       ),
       numericInput(
         inputId = "hours_back",
@@ -164,11 +205,9 @@ ui <- fluidPage(
       helpText(
         HTML(
           paste0(
-            "This uses: <code>/api/data/metar?ids=&lt;ICAO&gt;&amp;format=json&amp;hours=&lt;n&gt;&amp;taf=[true/false]</code>.<br>",
-            "Then it sends each raw METAR/TAF string to FlightPlanDatabase.com in the form:<br>",
-            "<code>https://flightplandatabase.com/METAR?s=&lt;URL‐encoded raw&gt;</code>.<br>",
-            "Below, you’ll see each raw METAR and raw TAF string, plus a FlightDB‐generated ",
-            "breakdown (token + description)."
+            "Choose an airport by typing its name or city (e.g. \"Los Angeles\").<br>",
+            "Once selected, the ICAO code will be used to fetch raw METAR/TAF from AviationWeather.gov.<br>",
+            "Then each raw METAR/TAF is sent to FlightPlanDatabase.com to decode into tokens + descriptions."
           )
         )
       )
@@ -196,9 +235,18 @@ ui <- fluidPage(
 )
 
 # ------------------------------------------------------------------------------
-# Shiny Server (modified to use decode_via_flightdb and display obsTime)
+# Shiny Server
 # ------------------------------------------------------------------------------
 server <- function(input, output, session) {
+  # Populate the selectizeInput server-side for performance, with no default selection
+  updateSelectizeInput(
+    session,
+    "icao_code",
+    choices  = icao_choices,
+    server   = TRUE,
+    selected = character(0)
+  )
+  
   # Reactive values to store raw METAR/TAF data.frames & decoded breakdowns
   metar_df_r      <- reactiveVal(NULL)      # data.frame with columns RawMETAR, ObsTime
   metar_map_list  <- reactiveVal(list())    # list of data.frames, one per METAR
@@ -206,22 +254,19 @@ server <- function(input, output, session) {
   taf_map_list    <- reactiveVal(list())    # list of data.frames, one per TAF
   
   observeEvent(input$btn_fetch, {
-    icao     <- toupper(trimws(input$icao_code))
+    # The selectizeInput returns the ICAO code directly, since choices = icao_choices
+    icao     <- toupper(trimws(input$icao_code %||% ""))
     hrs      <- input$hours_back
     with_taf <- input$include_taf
     
-    # Validate ICAO code
-    if (!grepl("^[A-Z]{4}$", icao)) {
+    # If nothing is selected, show a modal and do nothing
+    if (icao == "") {
       showModal(modalDialog(
-        title = "Invalid ICAO Code",
-        "Please enter a four‐letter ICAO airport code (e.g. KLAX).",
+        title = "No Airport Selected",
+        "Please select an airport from the dropdown above.",
         easyClose = TRUE,
         footer = NULL
       ))
-      metar_df_r(NULL)
-      metar_map_list(list())
-      taf_df_r(NULL)
-      taf_map_list(list())
       return()
     }
     
@@ -295,7 +340,7 @@ server <- function(input, output, session) {
   })
   
   # ----------------------------------------------------------------------------
-  # Render METAR breakdown UI (with correctly styled <small> for obsTime)
+  # Render METAR breakdown UI (with human-readable ObsTime)
   # ----------------------------------------------------------------------------
   output$metar_breakdown_ui <- renderUI({
     df_metar <- metar_df_r()
@@ -309,7 +354,7 @@ server <- function(input, output, session) {
       raw_str  <- df_metar$RawMETAR[i]
       parts_df <- maps[[i]]
       
-      # Convert obsTime to human-readable UTC timestamp
+      # Convert obsTime (UNIX epoch) to human-readable UTC timestamp
       obs_epoch <- df_metar$ObsTime[i]
       obs_txt   <- as.character(
         as.POSIXct(obs_epoch, origin = "1970-01-01", tz = "UTC")
